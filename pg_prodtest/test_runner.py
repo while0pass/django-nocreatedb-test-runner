@@ -28,9 +28,9 @@ class NoCreateDbTestRunner(DiscoverRunner):
 	Если перед началом тестов тестовые таблицы уже есть в базе, то они будут
 	удалены и пересозданы заново.
 
-	Префикс можно задать либо через настройки с помощью
-	переменной ``TEST_RUNNER_NOCREATEDB_TABLE_PREFIX``,
-	либо через опцию ``--table-prefix``.
+	Префикс можно задать через настройки с помощью переменной
+	``TEST_RUNNER_NOCREATEDB_PREFIX``. Одноразовое использование префикса
+	также возможно через опцию ``--table-prefix``.
 
 	Внутри тестов текущий табличный префикс можно узнать из настроек
 	``settings.TEST_RUNNER_NOCREATEDB_TABLE_PREFIX``.
@@ -38,6 +38,7 @@ class NoCreateDbTestRunner(DiscoverRunner):
 
 	DEFAULT_TABLE_PREFIX = 'test_'
 	TABLE_PREFIX_SETTINGS_NAME = 'TEST_RUNNER_NOCREATEDB_TABLE_PREFIX'
+	DB_INDEX_NAME_LENGTH_LIMIT = 30
 
 	def __init__(self, *args, table_prefix=None, **kwargs):
 		self.table_prefix = table_prefix
@@ -58,17 +59,15 @@ class NoCreateDbTestRunner(DiscoverRunner):
 		super().add_arguments(parser)
 		parser.add_argument(
 			"--table-prefix",
-			help="The prefix for test db tables when db user has no CREATEDB permission",
+			help="The prefix for test db tables and indexes when db user has no CREATEDB permission",
 		)
 
 	def setup_databases(self, **kwargs: Any) -> List[Tuple[BaseDatabaseWrapper, str, bool]]:
 		connection = self.default_db_connection
-		prefix = self.table_prefix
 		available_tables = connection.introspection.table_names()
 		for appname in apps.all_models:
 			for model in apps.all_models[appname].values():
-				if prefix and not model._meta.db_table.startswith(prefix):
-					model._meta.db_table = prefix + model._meta.db_table
+				self._setup_prefixes(model)
 		with connection.schema_editor() as schema_editor:
 			for model in apps.get_models():
 				if model._meta.db_table in available_tables:
@@ -82,10 +81,20 @@ class NoCreateDbTestRunner(DiscoverRunner):
 			with connection.schema_editor() as schema_editor:
 				for model in apps.get_models():
 					schema_editor.delete_model(model)
-		prefix = self.table_prefix
 		for model in apps.get_models():
-			if prefix and model._meta.db_table.startswith(prefix):
-				model._meta.db_table = model._meta.db_table[len(prefix):]
+			self._teardown_prefixes(model)
+
+	def setup_test_environment(self, **kwargs):
+		self._setup_table_prefix()
+		print('Prefix for test tables and indexes: ', self.table_prefix)
+		super().setup_test_environment(**kwargs)
+
+	def teardown_test_environment(self, **kwargs):
+		if self.old_settings_table_prefix is not None:
+			setattr(settings, self.TABLE_PREFIX_SETTINGS_NAME,
+					self.old_settings_table_prefix)
+			del self.old_settings_table_prefix
+		super().teardown_test_environment(**kwargs)
 
 	def _setup_table_prefix(self):
 		if not self.table_prefix:
@@ -98,12 +107,20 @@ class NoCreateDbTestRunner(DiscoverRunner):
 			settings, self.TABLE_PREFIX_SETTINGS_NAME, None)
 		setattr(settings, self.TABLE_PREFIX_SETTINGS_NAME, self.table_prefix)
 
-	def setup_test_environment(self, **kwargs):
-		self._setup_table_prefix()
-		super().setup_test_environment(**kwargs)
+	def _setup_prefixes(self, model):
+		prefix = self.table_prefix
+		if not model._meta.db_table.startswith(prefix):
+			model._meta.db_table = prefix + model._meta.db_table
+		for ix in model._meta.indexes:
+			if not ix.name.startswith(prefix):
+				ix.old_name = ix.name
+				ix.name = (prefix + ix.name)[:self.DB_INDEX_NAME_LENGTH_LIMIT]
 
-	def teardown_test_environment(self, **kwargs):
-		if self.old_settings_table_prefix is not None:
-			setattr(settings, self.TABLE_PREFIX_SETTINGS_NAME,
-					self.old_settings_table_prefix)
-		super().teardown_test_environment(**kwargs)
+	def _teardown_prefixes(self, model):
+		prefix = self.table_prefix
+		if model._meta.db_table.startswith(prefix):
+			model._meta.db_table = model._meta.db_table[len(prefix):]
+		for ix in model._meta.indexes:
+			if ix.name.startswith(prefix):
+				ix.name = ix.old_name
+				del ix.old_name
